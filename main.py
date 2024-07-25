@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from sklearn.metrics.pairwise import cosine_distances
 
 
-
 # ---------------------------------------------------------------------------------------------------------------------
 
 # Define a class to store a detection
@@ -40,7 +39,6 @@ class Match(SimpleNamespace):
 
 # Similarity threshold for face matching
 SIMILARITY_THRESHOLD = 1.0
-
 
 # Get twilio ice server configuration using twilio credentials from environment variables (set in streamlit secrets)
 # Ref: https://www.twilio.com/docs/stun-turn/api
@@ -197,14 +195,15 @@ def draw_annotations(frame: np.ndarray, detections: List[Detection], matches: Li
     # Draw Matches
     for match in matches:
         detection = match.subject_id.detection
-        name = match.gallery_id.name
+        name = match.gallery_id.name if match.distance < SIMILARITY_THRESHOLD else "Penyusup"
+        color = (0, 255, 0) if name != "Penyusup" else (0, 0, 255)
 
-        # Draw Bounding Box in green
+        # Draw Bounding Box in green if recognized, red if not
         cv2.rectangle(
             frame,
             (detection.bbox[0] * upscale_factor).astype(int),
             (detection.bbox[1] * upscale_factor).astype(int),
-            (0, 255, 0),
+            color,
             2,
         )
 
@@ -233,7 +232,7 @@ def draw_annotations(frame: np.ndarray, detections: List[Detection], matches: Li
             ),
             cv2.LINE_AA,
             0.7,
-            (0, 0, 0),
+            color,
             2,
         )
 
