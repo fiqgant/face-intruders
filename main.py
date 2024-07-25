@@ -279,10 +279,10 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 
 # Streamlit app configuration
 # Set page layout for streamlit to wide
-st.set_page_config(layout="wide", page_title="Live Webcam Face Recognition", page_icon=":sunglasses:")
+st.set_page_config(layout="wide", page_title="Smart CCTV", page_icon=":sunglasses:")
 
 # Title
-st.title("Live Webcam Face Recognition")
+st.title("Smart CCTV")
 
 # Face gallery
 st.markdown("**Face Gallery**")
