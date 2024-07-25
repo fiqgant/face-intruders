@@ -41,13 +41,13 @@ def recognize(image, TOLERANCE):
             name = database[match_index]['name']
             id = database[match_index]['id']
             distance = round(distance[match_index], 2)
-            cv2.putText(image, str(distance), (left, top - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+            cv2.putText(image, str(distance), (left, top - 30), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
         else:
-            cv2.putText(image, "Penyusup!", (left, top - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            cv2.putText(image, "Penyusup!", (left, top - 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3)
             print("ALERT: Penyusup terdeteksi!")
             
         cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
-        cv2.putText(image, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(image, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
     return image, name, id
 
 def isFaceExists(image):

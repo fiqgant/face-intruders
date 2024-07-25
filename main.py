@@ -15,6 +15,7 @@ st.sidebar.title("Pengaturan")
 # Buat menu bar
 menu = ["Gambar", "Kamera"]
 choice = st.sidebar.selectbox("Tipe Input", menu)
+
 # Slider untuk menyesuaikan toleransi
 TOLERANCE = st.sidebar.slider("Toleransi", 0.0, 1.0, 0.5, 0.01)
 st.sidebar.info("Toleransi adalah ambang batas untuk pengenalan wajah. Semakin rendah toleransi, semakin ketat pengenalan wajah. Semakin tinggi toleransi, semakin longgar pengenalan wajah.")
