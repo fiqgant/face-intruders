@@ -1,72 +1,336 @@
 import streamlit as st
+import numpy as np
+import onnxruntime as rt
+import mediapipe as mp
+import os
 import cv2
-import face_recognition as frg
-import yaml 
-from utils import recognize, build_dataset
+import av
+from typing import List
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+from twilio.rest import Client
+from skimage.transform import SimilarityTransform
+from types import SimpleNamespace
+from sklearn.metrics.pairwise import cosine_distances
 
-st.set_page_config(layout="wide")
-# Konfigurasi
-cfg = yaml.load(open('config.yaml','r'), Loader=yaml.FullLoader)
-PICTURE_PROMPT = cfg['INFO']['PICTURE_PROMPT']
-WEBCAM_PROMPT = cfg['INFO']['WEBCAM_PROMPT']
 
-st.sidebar.title("Pengaturan")
 
-# Buat menu bar
-menu = ["Gambar", "Kamera"]
-choice = st.sidebar.selectbox("Tipe Input", menu)
+# ---------------------------------------------------------------------------------------------------------------------
 
-# Slider untuk menyesuaikan toleransi
-TOLERANCE = st.sidebar.slider("Toleransi", 0.0, 1.0, 0.5, 0.01)
-st.sidebar.info("Toleransi adalah ambang batas untuk pengenalan wajah. Semakin rendah toleransi, semakin ketat pengenalan wajah. Semakin tinggi toleransi, semakin longgar pengenalan wajah.")
+# Define a class to store a detection
+class Detection(SimpleNamespace):
+    bbox: List[List[float]] = None
+    landmarks: List[List[float]] = None
 
-# Bagian Informasi
-st.sidebar.title("Informasi Wajah")
-name_container = st.sidebar.empty()
-id_container = st.sidebar.empty()
-name_container.info('Nama: Tidak Diketahui')
-id_container.success('ID: Tidak Diketahui')
 
-if choice == "Gambar":
-    st.title("Sistem Pengenalan Wajah")
-    st.write(PICTURE_PROMPT)
-    uploaded_images = st.file_uploader("Unggah", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
-    if len(uploaded_images) != 0:
-        for image in uploaded_images:
-            image = frg.load_image_file(image)
-            image, name, id = recognize(image, TOLERANCE) 
-            name_container.info(f"Nama: {name}")
-            id_container.success(f"ID: {id}")
-            st.image(image)
-    else: 
-        st.info("Silakan unggah gambar")
-    
-elif choice == "Kamera":
-    st.title("Sistem Pengenalan Wajah")
-    st.write(WEBCAM_PROMPT)
-    # Pengaturan Kamera
-    cam = cv2.VideoCapture(0)
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)  # Set to full HD width
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)  # Set to full HD height
-    FRAME_WINDOW = st.image([])
+# Define a class to store an identity
+class Identity(SimpleNamespace):
+    detection: Detection = Detection()
+    name: str = None
+    embedding: np.ndarray = None
+    face: np.ndarray = None
 
-    while True:
-        ret, frame = cam.read()
-        if not ret:
-            st.error("Gagal mengambil frame dari kamera")
-            st.info("Silakan matikan aplikasi lain yang menggunakan kamera dan restart aplikasi")
-            st.stop()
-        image, name, id = recognize(frame, TOLERANCE)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        name_container.info(f"Nama: {name}")
-        id_container.success(f"ID: {id}")
-        FRAME_WINDOW.image(image)
 
-with st.sidebar.form(key='my_form'):
-    st.title("Bagian Pengembang")
-    submit_button = st.form_submit_button(label='BANGUN ULANG DATASET')
-    if submit_button:
-        with st.spinner("Membangun ulang dataset..."):
-            build_dataset()
-        st.success("Dataset telah direset")
+# Define a class to store a match
+class Match(SimpleNamespace):
+    subject_id: Identity = Identity()
+    gallery_id: Identity = Identity()
+    distance: float = None
+    name: str = None
+
+
+# Similarity threshold for face matching
+SIMILARITY_THRESHOLD = 1.0
+
+
+# Get twilio ice server configuration using twilio credentials from environment variables (set in streamlit secrets)
+# Ref: https://www.twilio.com/docs/stun-turn/api
+ICE_SERVERS = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]).tokens.create().ice_servers
+
+# Init face detector and face recognizer
+FACE_RECOGNIZER = rt.InferenceSession("model.onnx", providers=rt.get_available_providers())
+FACE_DETECTOR = mp.solutions.face_mesh.FaceMesh(
+    refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5, max_num_faces=7
+)
+
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def detect_faces(frame: np.ndarray) -> List[Detection]:
+    # Process the frame with the face detector
+    result = FACE_DETECTOR.process(frame)
+
+    # Initialize an empty list to store the detected faces
+    detections = []
+
+    # Check if any faces were detected
+    if result.multi_face_landmarks:
+        # Iterate over each detected face
+        for count, detection in enumerate(result.multi_face_landmarks):
+            # Select 5 Landmarks
+            five_landmarks = np.asarray(detection.landmark)[[470, 475, 1, 57, 287]]
+
+            # Extract the x and y coordinates of the landmarks of interest
+            landmarks = np.asarray(
+                [[landmark.x * frame.shape[1], landmark.y * frame.shape[0]] for landmark in five_landmarks]
+            )
+
+            # Extract the x and y coordinates of all landmarks
+            all_x_coords = [landmark.x * frame.shape[1] for landmark in detection.landmark]
+            all_y_coords = [landmark.y * frame.shape[0] for landmark in detection.landmark]
+
+            # Compute the bounding box of the face
+            x_min, x_max = int(min(all_x_coords)), int(max(all_x_coords))
+            y_min, y_max = int(min(all_y_coords)), int(max(all_y_coords))
+            bbox = [[x_min, y_min], [x_max, y_max]]
+
+            # Create a Detection object for the face
+            detection = Detection(idx=count, bbox=bbox, landmarks=landmarks, confidence=None)
+
+            # Add the detection to the list
+            detections.append(detection)
+
+    # Return the list of detections
+    return detections
+
+
+def recognize_faces(frame: np.ndarray, detections: List[Detection]) -> List[Identity]:
+    if not detections:
+        return []
+
+    identities = []
+    for detection in detections:
+        # ALIGNMENT -----------------------------------------------------------
+        # Target landmark coordinates (as used in training)
+        landmarks_target = np.array(
+            [
+                [38.2946, 51.6963],
+                [73.5318, 51.5014],
+                [56.0252, 71.7366],
+                [41.5493, 92.3655],
+                [70.7299, 92.2041],
+            ],
+            dtype=np.float32,
+        )
+        tform = SimilarityTransform()
+        tform.estimate(detection.landmarks, landmarks_target)
+        tmatrix = tform.params[0:2, :]
+        face_aligned = cv2.warpAffine(frame, tmatrix, (112, 112), borderValue=0.0)
+        # ---------------------------------------------------------------------
+
+        # INFERENCE -----------------------------------------------------------
+        # Inference face embeddings with onnxruntime
+        input_image = (np.asarray([face_aligned]).astype(np.float32) / 255.0).clip(0.0, 1.0)
+        embedding = FACE_RECOGNIZER.run(None, {"input_image": input_image})[0][0]
+        # ---------------------------------------------------------------------
+
+        # Create Identity object
+        identities.append(Identity(detection=detection, embedding=embedding, face=face_aligned))
+
+    return identities
+
+
+def match_faces(subjects: List[Identity], gallery: List[Identity]) -> List[Match]:
+    if len(gallery) == 0 or len(subjects) == 0:
+        return []
+
+    # Get Embeddings
+    embs_gal = np.asarray([identity.embedding for identity in gallery])
+    embs_det = np.asarray([identity.embedding for identity in subjects])
+
+    # Calculate Cosine Distances
+    cos_distances = cosine_distances(embs_det, embs_gal)
+
+    # Find Matches
+    matches = []
+    for ident_idx, identity in enumerate(subjects):
+        dists_to_identity = cos_distances[ident_idx]
+        idx_min = np.argmin(dists_to_identity)
+        if dists_to_identity[idx_min] < SIMILARITY_THRESHOLD:
+            matches.append(Match(subject_id=identity, gallery_id=gallery[idx_min], distance=dists_to_identity[idx_min]))
+
+    # Sort Matches by identity_idx
+    matches = sorted(matches, key=lambda match: match.gallery_id.name)
+
+    return matches
+
+
+def draw_annotations(frame: np.ndarray, detections: List[Detection], matches: List[Match]) -> np.ndarray:
+    shape = np.asarray(frame.shape[:2][::-1])
+
+    # Upscale frame to 1080p for better visualization of drawn annotations
+    frame = cv2.resize(frame, (1920, 1080))
+    upscale_factor = np.asarray([1920 / shape[0], 1080 / shape[1]])
+    shape = np.asarray(frame.shape[:2][::-1])
+
+    # Make frame writeable (for better performance)
+    frame.flags.writeable = True
+
+    # Draw Detections
+    for detection in detections:
+        # Draw Landmarks
+        for landmark in detection.landmarks:
+            cv2.circle(frame, (landmark * upscale_factor).astype(int), 2, (255, 255, 255), -1)
+
+        # Draw Bounding Box
+        cv2.rectangle(
+            frame,
+            (detection.bbox[0] * upscale_factor).astype(int),
+            (detection.bbox[1] * upscale_factor).astype(int),
+            (255, 0, 0),
+            2,
+        )
+
+        # Draw Index
+        cv2.putText(
+            frame,
+            str(detection.idx),
+            (
+                ((detection.bbox[1][0] + 2) * upscale_factor[0]).astype(int),
+                ((detection.bbox[1][1] + 2) * upscale_factor[1]).astype(int),
+            ),
+            cv2.LINE_AA,
+            0.5,
+            (0, 0, 0),
+            2,
+        )
+
+    # Draw Matches
+    for match in matches:
+        detection = match.subject_id.detection
+        name = match.gallery_id.name
+
+        # Draw Bounding Box in green
+        cv2.rectangle(
+            frame,
+            (detection.bbox[0] * upscale_factor).astype(int),
+            (detection.bbox[1] * upscale_factor).astype(int),
+            (0, 255, 0),
+            2,
+        )
+
+        # Draw Banner
+        cv2.rectangle(
+            frame,
+            (
+                (detection.bbox[0][0] * upscale_factor[0]).astype(int),
+                (detection.bbox[0][1] * upscale_factor[1] - (shape[1] // 25)).astype(int),
+            ),
+            (
+                (detection.bbox[1][0] * upscale_factor[0]).astype(int),
+                (detection.bbox[0][1] * upscale_factor[1]).astype(int),
+            ),
+            (255, 255, 255),
+            -1,
+        )
+
+        # Draw Name
+        cv2.putText(
+            frame,
+            name,
+            (
+                ((detection.bbox[0][0] + shape[0] // 400) * upscale_factor[0]).astype(int),
+                ((detection.bbox[0][1] - shape[1] // 50) * upscale_factor[1]).astype(int),
+            ),
+            cv2.LINE_AA,
+            0.7,
+            (0, 0, 0),
+            2,
+        )
+
+        # Draw Distance
+        cv2.putText(
+            frame,
+            f" Distance: {match.distance:.2f}",
+            (
+                ((detection.bbox[0][0] + shape[0] // 400) * upscale_factor[0]).astype(int),
+                ((detection.bbox[0][1] - shape[1] // 350) * upscale_factor[1]).astype(int),
+            ),
+            cv2.LINE_AA,
+            0.5,
+            (0, 0, 0),
+            2,
+        )
+
+    return frame
+
+
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    # Convert frame to numpy array
+    frame = frame.to_ndarray(format="rgb24")
+
+    # Run face detection
+    detections = detect_faces(frame)
+
+    # Run face recognition
+    subjects = recognize_faces(frame, detections)
+
+    # Run face matching
+    matches = match_faces(subjects, gallery)
+
+    # Draw annotations
+    frame = draw_annotations(frame, detections, matches)
+
+    # Convert frame back to av.VideoFrame
+    frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+    return frame
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Streamlit app configuration
+# Set page layout for streamlit to wide
+st.set_page_config(layout="wide", page_title="Live Webcam Face Recognition", page_icon=":sunglasses:")
+
+# Title
+st.title("Live Webcam Face Recognition")
+
+# Face gallery
+st.markdown("**Face Gallery**")
+gal_container = st.container()
+files = gal_container.file_uploader(
+    "Upload images to gallery",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+)
+
+# Process uploaded files and add to gallery
+gallery = []
+for file in files:
+    # Read file bytes
+    file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+
+    # Decode image and convert from BGR to RGB
+    img = cv2.cvtColor(cv2.imdecode(file_bytes, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+
+    # Detect faces
+    detections = detect_faces(img)
+
+    if detections:
+        # recognize faces
+        subjects = recognize_faces(img, detections[:1])  # take only one face
+
+        # Add subjects to gallery
+        gallery.append(
+            Identity(name=os.path.splitext(file.name)[0], embedding=subjects[0].embedding, face=subjects[0].face)
+        )
+
+# Preview gallery images
+gal_container.image(image=[identity.face for identity in gallery], caption=[identity.name for identity in gallery])
+
+# Main window for stream
+st.markdown("**Live Stream**")
+
+# Start streaming component
+with st.container():
+
+    webrtc_streamer(
+        key="LiveFaceRecognition",
+        mode=WebRtcMode.SENDRECV,
+        video_frame_callback=video_frame_callback,
+        rtc_configuration={"iceServers": ICE_SERVERS},
+        media_stream_constraints={"video": {"width": 1280}, "audio": False},
+    )
+    # except:
+    #     st.error("There is a problem with your webcam. Try a different Browser or device.")
